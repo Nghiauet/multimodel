@@ -1,68 +1,33 @@
 import torch
-import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 import numpy as np
-import pickle
-import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, TensorDataset
 import os
 
-# Import all necessary modules
-from VQ_VAE.model import VQVAE, compute_loss, evaluate_VQVAE
+# Import model modules
+from VQ_VAE.model import VQVAE
 from iGPT.model import iGPT
 from iGPT.tokenizer import Tokenizer
-from iGPT.train import train_igpt, evaluate_model
 from iGPT.create_dataset import create_dataset
 from iGPT.sample import generate_conditional_samples_from_text, generate_conditional_samples_from_image, generate_unconditional_samples
 
-def load_data(data_path):
-    """Load data from pickle file"""
-    with open(data_path, 'rb') as f:
-        return pickle.load(f)
+# Import utility functions
+from utils.utils import load_pickled_data, load_colored_mnist_text
+from utils.data_processor import DataProcessor
+from utils.visualization import Visualizer
 
-def visualize_data(data, texts=None, num_samples=9, title="Data Samples"):
-    """Visualize data samples"""
-    fig, axes = plt.subplots(3, 3, figsize=(10, 10))
-    fig.suptitle(title, fontsize=16)
-    
-    indices = np.random.choice(len(data), size=num_samples, replace=False)
-    
-    for i, idx in enumerate(indices):
-        row, col = i // 3, i % 3
-        img = data[idx]
-        
-        # Handle different data formats
-        if img.dtype == np.uint8:
-            img = img.astype(np.float32) / 255.0
-        elif img.max() > 1:
-            img = img.astype(np.float32) / 255.0
-            
-        axes[row, col].imshow(img)
-        axes[row, col].axis('off')
-        
-        if texts is not None:
-            axes[row, col].set_title(texts[idx], fontsize=8)
-    
-    plt.tight_layout()
-    plt.show()
+# Import training modules
+from training import VQVAETrainer, iGPTTrainer
+
+
 
 def train_vqvae(train_data, test_data, device, config):
-    """Train VQ-VAE model"""
+    """Train VQ-VAE model using the new training framework"""
     print("=== Training VQ-VAE ===")
     
-    # Prepare data (normalize to [-1, 1])
-    train_data = train_data.astype(np.float32) / 127.5 - 1.0
-    test_data = test_data.astype(np.float32) / 127.5 - 1.0
-    
-    # Convert to tensors and create data loaders
-    train_tensor = torch.FloatTensor(train_data).permute(0, 3, 1, 2)
-    test_tensor = torch.FloatTensor(test_data).permute(0, 3, 1, 2)
-    
-    train_dataset = TensorDataset(train_tensor)
-    test_dataset = TensorDataset(test_tensor)
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False)
+    # Prepare data using unified data processor
+    train_loader, test_loader = DataProcessor.prepare_vqvae_data(
+        train_data, test_data, config['batch_size']
+    )
     
     # Initialize model
     model = VQVAE(
@@ -71,57 +36,17 @@ def train_vqvae(train_data, test_data, device, config):
         D=config['vqvae_D']
     ).to(device)
     
-    # Add quantize method to model for compatibility
-    def quantize(self, x):
-        """Quantize images to discrete tokens"""
-        if isinstance(x, np.ndarray):
-            x = torch.FloatTensor(x).to(device)
-            if x.max() > 1:
-                x = x / 127.5 - 1.0
-            x = x.permute(0, 3, 1, 2)
-        return self.get_tokens(x)
+    # Add quantize method for compatibility
+    model = DataProcessor.add_quantize_method(model, device)
     
-    # Bind the method to the model instance
-    model.quantize = quantize.__get__(model, VQVAE)
-    
+    # Initialize optimizer and trainer
     optimizer = optim.Adam(model.parameters(), lr=config['vqvae_lr'])
+    trainer = VQVAETrainer(model, optimizer, device)
     
-    train_losses = []
-    test_losses = []
-    
-    # Initial evaluation
-    test_loss = evaluate_VQVAE(model, test_loader)
-    test_losses.append(test_loss)
-    print(f"Initial VQ-VAE Test Loss: {test_loss:.4f}")
-    
-    # Training loop
-    model.train()
-    for epoch in range(config['vqvae_epochs']):
-        epoch_losses = []
-        
-        for batch_idx, (x,) in enumerate(train_loader):
-            x = x.to(device)
-            optimizer.zero_grad()
-            
-            z_e, z_q, recon_x = model(x)
-            loss = compute_loss(x, recon_x, z_e, z_q)
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            
-            epoch_losses.append(loss.item())
-            train_losses.append(loss.item())
-            
-            if batch_idx % 50 == 0:
-                print(f"Epoch {epoch+1}/{config['vqvae_epochs']}, Batch {batch_idx}, Loss: {loss.item():.4f}")
-        
-        # Evaluate after each epoch
-        test_loss = evaluate_VQVAE(model, test_loader)
-        test_losses.append(test_loss)
-        
-        avg_train_loss = np.mean(epoch_losses)
-        print(f"Epoch {epoch+1}/{config['vqvae_epochs']} - Train Loss: {avg_train_loss:.4f}, Test Loss: {test_loss:.4f}")
+    # Train the model
+    train_losses, test_losses = trainer.train(
+        train_loader, test_loader, config['vqvae_epochs']
+    )
     
     # Save model
     os.makedirs('checkpoints', exist_ok=True)
@@ -131,7 +56,7 @@ def train_vqvae(train_data, test_data, device, config):
     return model, train_losses, test_losses
 
 def train_multimodal_igpt(train_data, test_data, train_texts, test_texts, vqvae_model, device, config):
-    """Train multimodal iGPT model"""
+    """Train multimodal iGPT model using the new training framework"""
     print("\n=== Training Multimodal iGPT ===")
     
     # Create tokenizer
@@ -160,11 +85,13 @@ def train_multimodal_igpt(train_data, test_data, train_texts, test_texts, vqvae_
         dropout=config['dropout']
     ).to(device)
     
-    # Train model
-    train_losses, test_losses = train_igpt(
-        model, train_loader, test_loader, 
-        sequence_length, total_vocab_size, device,
-        config['igpt_epochs'], config['igpt_lr']
+    # Initialize optimizer and trainer
+    optimizer = optim.Adam(model.parameters(), lr=config['igpt_lr'])
+    trainer = iGPTTrainer(model, optimizer, device, total_vocab_size, sequence_length)
+    
+    # Train the model
+    train_losses, test_losses = trainer.train(
+        train_loader, test_loader, config['igpt_epochs']
     )
     
     # Save model
@@ -200,70 +127,44 @@ def generate_samples(model, text_tokenizer, vqvae_model, test_data, test_texts, 
     return samples_image_conditioned, samples_text_conditioned, samples_unconditioned
 
 def visualize_samples(samples_image_conditioned, samples_text_conditioned, samples_unconditioned):
-    """Visualize generated samples"""
+    """Visualize generated samples using unified visualization"""
     print("\n=== Visualizing Results ===")
-    
-    def plot_samples(samples, title, filename):
-        fig, axes = plt.subplots(3, 3, figsize=(10, 10))
-        fig.suptitle(title, fontsize=16)
-        
-        for i in range(9):
-            row, col = i // 3, i % 3
-            img, text = samples[i]
-            
-            axes[row, col].imshow(img)
-            axes[row, col].set_title(text, fontsize=8)
-            axes[row, col].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(filename)
-        plt.show()
     
     # Create results directory
     os.makedirs('results', exist_ok=True)
     
-    # Plot different types of samples
-    plot_samples(samples_image_conditioned, "Image-Conditioned Samples", "results/image_conditioned_samples.png")
-    plot_samples(samples_text_conditioned, "Text-Conditioned Samples", "results/text_conditioned_samples.png")
-    plot_samples(samples_unconditioned, "Unconditional Samples", "results/unconditional_samples.png")
+    # Visualize different types of samples
+    Visualizer.show_image_text_grid(
+        samples_image_conditioned, 
+        title="Image-Conditioned Samples",
+        save_path="results/image_conditioned_samples.png"
+    )
+    
+    Visualizer.show_image_text_grid(
+        samples_text_conditioned, 
+        title="Text-Conditioned Samples",
+        save_path="results/text_conditioned_samples.png"
+    )
+    
+    Visualizer.show_image_text_grid(
+        samples_unconditioned, 
+        title="Unconditional Samples",
+        save_path="results/unconditional_samples.png"
+    )
 
 def plot_training_curves(vqvae_train_losses, vqvae_test_losses, igpt_train_losses, igpt_test_losses):
-    """Plot training curves"""
+    """Plot training curves using unified visualization"""
     print("\n=== Plotting Training Curves ===")
     
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    # Create results directory
+    os.makedirs('results', exist_ok=True)
     
-    # VQ-VAE training loss
-    axes[0, 0].plot(vqvae_train_losses)
-    axes[0, 0].set_title('VQ-VAE Training Loss')
-    axes[0, 0].set_xlabel('Iteration')
-    axes[0, 0].set_ylabel('Loss')
-    axes[0, 0].grid(True)
-    
-    # VQ-VAE test loss
-    axes[0, 1].plot(vqvae_test_losses)
-    axes[0, 1].set_title('VQ-VAE Test Loss')
-    axes[0, 1].set_xlabel('Epoch')
-    axes[0, 1].set_ylabel('Loss')
-    axes[0, 1].grid(True)
-    
-    # iGPT training loss
-    axes[1, 0].plot(igpt_train_losses)
-    axes[1, 0].set_title('iGPT Training Loss')
-    axes[1, 0].set_xlabel('Iteration')
-    axes[1, 0].set_ylabel('Loss')
-    axes[1, 0].grid(True)
-    
-    # iGPT test loss
-    axes[1, 1].plot(igpt_test_losses)
-    axes[1, 1].set_title('iGPT Test Loss')
-    axes[1, 1].set_xlabel('Epoch')
-    axes[1, 1].set_ylabel('Loss')
-    axes[1, 1].grid(True)
-    
-    plt.tight_layout()
-    plt.savefig('results/training_curves.png')
-    plt.show()
+    # Use unified visualization for combined training curves
+    Visualizer.plot_combined_training_curves(
+        vqvae_train_losses, vqvae_test_losses,
+        igpt_train_losses, igpt_test_losses,
+        save_path="results/training_curves.png"
+    )
 
 def main():
     """Main function to run the complete pipeline"""
@@ -300,17 +201,14 @@ def main():
     
     # Load VQ-VAE training data
     print("Loading VQ-VAE training data...")
-    vqvae_data = load_data('data/mnist_colored.pkl')
-    train_data_vqvae, test_data_vqvae = vqvae_data['train'], vqvae_data['test']
+    train_data_vqvae, test_data_vqvae = load_pickled_data('data/mnist_colored.pkl')
     
     print(f"VQ-VAE train data shape: {train_data_vqvae.shape}")
     print(f"VQ-VAE test data shape: {test_data_vqvae.shape}")
     
     # Load multimodal data
     print("Loading multimodal data...")
-    multimodal_data = load_data('data/colored_mnist_with_text.pkl')
-    train_data_mm, test_data_mm = multimodal_data['train_images'], multimodal_data['test_images']
-    train_texts, test_texts = multimodal_data['train_texts'], multimodal_data['test_texts']
+    train_data_mm, test_data_mm, train_texts, test_texts = load_colored_mnist_text('data/colored_mnist_with_text.pkl')
     
     print(f"Multimodal train data shape: {train_data_mm.shape}")
     print(f"Multimodal test data shape: {test_data_mm.shape}")
@@ -319,8 +217,8 @@ def main():
     
     # Visualize data
     print("\n=== Visualizing Data ===")
-    visualize_data(train_data_vqvae, title="VQ-VAE Training Data")
-    visualize_data(train_data_mm, train_texts, title="Multimodal Training Data")
+    Visualizer.show_image_grid(train_data_vqvae, title="VQ-VAE Training Data")
+    Visualizer.show_data_samples(train_data_mm, train_texts, title="Multimodal Training Data")
     
     # Train VQ-VAE
     vqvae_model, vqvae_train_losses, vqvae_test_losses = train_vqvae(
