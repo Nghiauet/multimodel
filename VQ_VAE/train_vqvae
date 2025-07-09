@@ -1,0 +1,266 @@
+def prepare_transformer_data(vqvae_model, data_loader, device):
+    """Extract tokens from VQ-VAE for transformer training"""
+    vqvae_model.eval()
+    all_tokens = []
+    
+    with torch.no_grad():
+        for batch in data_loader:
+            x = batch[0].to(device)
+            tokens = vqvae_model.get_tokens(x)  # [B, H, W]
+            
+            # Flatten and add start token
+            batch_size, H, W = tokens.shape
+            tokens_flat = tokens.view(batch_size, -1)  # [B, H*W]
+            
+            # Add start token (0) at the beginning
+            tokens_with_start = torch.cat([
+                torch.zeros(batch_size, 1, dtype=torch.long, device=device),
+                tokens_flat + 1  # Shift tokens by 1 to make room for start token
+            ], dim=1)  # [B, H*W + 1]
+            
+            all_tokens.append(tokens_with_start.cpu())
+    
+    return torch.cat(all_tokens, dim=0)
+
+def train_transformer_prior(vqvae_model, train_loader, test_loader, device, vocab_size=129, n_epochs=10):
+    """Train transformer prior on VQ-VAE tokens"""
+    
+    # Prepare training data
+    print("Extracting tokens from VQ-VAE...")
+    train_tokens = prepare_transformer_data(vqvae_model, train_loader, device)
+    test_tokens = prepare_transformer_data(vqvae_model, test_loader, device)
+    
+    sequence_length = train_tokens.shape[1]  # H*W + 1
+    
+    # Create transformer model
+    transformer = iGPT(
+        vocab_size=vocab_size,  # 128 codebook + 1 start token
+        context_length=sequence_length,
+        d_model=512,
+        n_heads=8,
+        n_layers=6,
+        dropout=0.1,
+        use_cache=True
+    ).to(device)
+    
+    optimizer = optim.Adam(transformer.parameters(), lr=3e-4)
+    
+    # Create data loaders for transformer training
+    train_dataset = TensorDataset(train_tokens)
+    test_dataset = TensorDataset(test_tokens)
+    train_loader_transformer = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    test_loader_transformer = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    
+    train_losses = []
+    test_losses = []
+    
+    # Initial evaluation
+    test_loss = evaluate_transformer(transformer, test_loader_transformer, device)
+    test_losses.append(test_loss)
+    print(f"Initial Transformer Test Loss: {test_loss:.4f}")
+    
+    transformer.train()
+    for epoch in range(n_epochs):
+        epoch_losses = []
+        
+        for batch in train_loader_transformer:
+            tokens = batch[0].to(device)
+            
+            # Prepare input and target
+            input_tokens = tokens[:, :-1]  # All but last token
+            target_tokens = tokens[:, 1:]   # All but first token
+            
+            optimizer.zero_grad()
+            logits = transformer(input_tokens)
+            
+            loss = F.cross_entropy(logits.reshape(-1, vocab_size), target_tokens.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            epoch_losses.append(loss.item())
+            train_losses.append(loss.item())
+        
+        # Evaluate on test set
+        test_loss = evaluate_transformer(transformer, test_loader_transformer, device)
+        test_losses.append(test_loss)
+        
+        avg_train_loss = np.mean(epoch_losses)
+        print(f"Epoch {epoch+1}/{n_epochs} - Train Loss: {avg_train_loss:.4f}, Test Loss: {test_loss:.4f}")
+    
+    return transformer, train_losses, test_losses
+
+def evaluate_transformer(model, data_loader, device):
+    """Evaluate transformer model"""
+    model.eval()
+    total_loss = 0
+    n_batches = 0
+    vocab_size = model.vocab_size
+    
+    with torch.no_grad():
+        for batch in data_loader:
+            tokens = batch[0].to(device)
+            
+            input_tokens = tokens[:, :-1]
+            target_tokens = tokens[:, 1:]
+            
+            logits = model(input_tokens)
+            loss = F.cross_entropy(logits.reshape(-1, vocab_size), target_tokens.reshape(-1))
+            
+            total_loss += loss.item()
+            n_batches += 1
+    
+    return total_loss / n_batches
+
+def sample_from_prior(transformer, vqvae_model, device, num_samples=100, H=8, W=8):
+    """Sample from transformer prior and decode with VQ-VAE"""
+    sequence_length = H * W + 1  # +1 for start token
+    vocab_size = transformer.vocab_size
+    
+    samples = []
+    transformer.eval()
+    
+    with torch.no_grad():
+        for i in range(num_samples):
+            # Start with just the start token (0)
+            sample = torch.zeros(1, sequence_length, dtype=torch.long, device=device)
+            
+            # Generate sequence autoregressively
+            for pos in range(1, sequence_length):
+                logits = transformer(sample[:, :pos])
+                logits = logits[:, -1, :]  # Get prediction for next token
+                
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, 1).squeeze(-1)
+                sample[:, pos] = next_token
+            
+            # Convert tokens back to image (remove start token and shift back)
+            tokens = sample[:, 1:] - 1  # Remove start token and shift back
+            tokens = tokens.clamp(0, 127)  # Ensure valid token range
+            tokens = tokens.view(1, H, W)
+            
+            # Decode with VQ-VAE
+            reconstructed = vqvae_model.decode_tokens(tokens)
+            
+            # Convert back to [0, 255] range and proper format
+            reconstructed = (reconstructed * 127.5 + 127.5).clamp(0, 255)
+            reconstructed = reconstructed.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+            
+            samples.append(reconstructed)
+    
+    return np.array(samples)
+
+def generate_reconstructions(vqvae_model, test_loader, device, num_pairs=50):
+    """Generate real image / reconstruction pairs"""
+    vqvae_model.eval()
+    pairs = []
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            if len(pairs) >= num_pairs:
+                break
+                
+            x = batch[0].to(device)
+            z_e, z_q, recon_x = vqvae_model(x)
+            
+            # Convert back to [0, 255] range
+            real_images = (x * 127.5 + 127.5).clamp(0, 255).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+            recon_images = (recon_x * 127.5 + 127.5).clamp(0, 255).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+            
+            for i in range(min(x.shape[0], num_pairs - len(pairs))):
+                pairs.append(real_images[i])
+                pairs.append(recon_images[i])
+    
+    return np.array(pairs[:num_pairs * 2])  # 50 pairs = 100 images
+
+# Update the q3 function
+def q3(train_data, test_data, dset_id):
+    """
+    train_data: An (n_train, 32, 32, 3) uint8 numpy array of color images with values in [0, 255]
+    test_data: An (n_test, 32, 32, 3) uint8 numpy array of color images with values in [0, 255]
+    dset_id: An identifying number of which dataset is given (1 or 2). Most likely
+               used to set different hyperparameters for different datasets
+
+    Returns
+    - a (# of training iterations,) numpy array of VQ-VAE train losess evaluated every minibatch
+    - a (# of epochs + 1,) numpy array of VQ-VAE test losses evaluated once at initialization and after each epoch
+    - a (# of training iterations,) numpy array of Transformer prior train losess evaluated every minibatch
+    - a (# of epochs + 1,) numpy array of Transformer prior test losses evaluated once at initialization and after each epoch
+    - a (100, 32, 32, 3) numpy array of 100 samples with values in {0, ... 255}
+    - a (100, 32, 32, 3) numpy array of 50 real image / reconstruction pairs
+      FROM THE TEST SET with values in [0, 255]
+    """
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    batch_size = 128
+    learning_rate = 1e-3
+    n_epochs_vqvae = 30
+    
+    # Prepare data
+    train_data = train_data.transpose(0, 3, 1, 2) / 127.5 - 1
+    test_data = test_data.transpose(0, 3, 1, 2) / 127.5 - 1
+    
+    train_tensor = torch.FloatTensor(train_data)
+    test_tensor = torch.FloatTensor(test_data)
+    
+    train_dataset = TensorDataset(train_tensor)
+    test_dataset = TensorDataset(test_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Train VQ-VAE
+    print("Training VQ-VAE...")
+    model = VQVAE(dim=256, K=128, D=256).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    vqvae_train_losses = []
+    vqvae_test_losses = []
+    
+    # Initial evaluation
+    test_loss = evaluate_VQVAE(model, test_loader)
+    print(f"Initial VQ-VAE Test Loss: {test_loss:.4f}")
+    vqvae_test_losses.append(test_loss)
+    
+    # Training loop
+    model.train()
+    for epoch in range(n_epochs_vqvae):
+        epoch_train_losses = []
+        
+        for batch_idx, batch in enumerate(train_loader):
+            x = batch[0].to(device)
+            optimizer.zero_grad()
+            z_e, z_q, recon_x = model(x)
+            
+            loss = compute_loss(x, recon_x, z_e, z_q)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            epoch_train_losses.append(loss.item())
+            vqvae_train_losses.append(loss.item())
+        
+        # Evaluate after each epoch
+        test_loss = evaluate_VQVAE(model, test_loader)
+        vqvae_test_losses.append(test_loss)
+        
+        if (epoch + 1) % 1 == 0:
+            avg_train = np.mean(epoch_train_losses)
+            print(f"VQ-VAE Epoch {epoch+1}/{n_epochs_vqvae} - Train Loss: {avg_train:.4f}, Test Loss: {test_loss:.4f}")
+    
+    # Train Transformer Prior
+    print("\nTraining Transformer Prior...")
+    transformer, prior_train_losses, prior_test_losses = train_transformer_prior(
+        model, train_loader, test_loader, device
+    )
+    
+    # Generate samples
+    print("\nGenerating samples...")
+    samples = sample_from_prior(transformer, model, device, num_samples=100)
+    
+    # Generate reconstructions
+    print("Generating reconstructions...")
+    reconstructions = generate_reconstructions(model, test_loader, device, num_pairs=50)
+    
+    return (vqvae_train_losses, vqvae_test_losses, 
+            prior_train_losses, prior_test_losses, 
+            samples, reconstructions)
